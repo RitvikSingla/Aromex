@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- FileProvider paths (ticket #84). The invoice PDF is downloaded to a cache subdir before it's
+     shared, so only that subdir is exposed as a content:// URI. -->
+<paths>
+    <cache-path name="invoices" path="invoices/" />
+</paths>

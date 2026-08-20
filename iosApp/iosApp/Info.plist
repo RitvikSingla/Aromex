@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CADisableMinimumFrameDurationOnPhone</key>
+	<true/>
+	<!-- Scan-to-add IMEIs (#45): required to open the camera for barcode scanning. -->
+	<key>NSCameraUsageDescription</key>
+	<string>Aromex uses the camera to scan a phone's IMEI barcode when adding stock.</string>
+	<!-- TODO(M1-04 Phase B): remove NSAppTransportSecurity once the gateway + HL move to HTTPS. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSExceptionDomains</key>
+		<dict>
+			<key>68.183.86.89</key>
+			<dict>
+				<key>NSExceptionAllowsInsecureHTTPLoads</key>
+				<true/>
+				<key>NSIncludesSubdomains</key>
+				<false/>
+			</dict>
+		</dict>
+	</dict>
+</dict>
+</plist>

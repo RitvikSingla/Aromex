@@ -1,0 +1,15 @@
+platform :ios, '14.0'
+
+target 'iosApp' do
+  use_frameworks! :linkage => :static
+
+  pod 'sharedLogic', :path => '../sharedLogic'
+
+  # Firebase
+  pod 'FirebaseAuth'
+  pod 'FirebaseFirestore'
+  pod 'FirebaseFunctions'
+  pod 'FirebaseStorage'
+
+  # Add iOS pods here as the app grows (image loading, payments, etc.)
+end

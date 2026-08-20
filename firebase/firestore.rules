@@ -1,0 +1,528 @@
+rules_version = '2';
+
+// Aromex per-client Firebase — Firestore Security Rules.
+//
+// What this guards (PRD §5, §7):
+//   - users/{uid}            — own-user read; admin writes; admin must be claim+doc consistent
+//   - companySettings/profile — all signed-in read; admin write (hlCompanyId/currency locked)
+//   - companySettingsChanges/ — admin-only, append-only audit of every settings change
+//   - purchases/{purchaseId}  — one Add-Inventory batch; client creates PENDING, CF owns the rest
+//     including the reversal trail (ticket #106). Mobile reverses via the `reverseStockBatch`
+//     callable, which re-checks admin server-side.
+//   - invites/{inviteId}     — admin-only read+write
+//   - entities/{entityId}    — profiles/parties; `profiles` view/manage; HL fields CF-owned
+//   - products/serials/attributes/imeiIndex — Inventory (M4); `inventory` view/manage.
+//     Race-safe add-stock runs as a CLIENT Firestore transaction (no Cloud Function in M4);
+//     these rules only guarantee the atomic multi-doc write is permitted for `manage` and
+//     denied otherwise. The exact transaction steps are the contract in
+//     docs/SCHEMA.md Part 2 (ADD STOCK / RELEASE IMEI). An IMEI is never edited in
+//     place — a mistyped one is voided + re-added — so serialId/productId/imei are
+//     immutable on update below. T3/T4 implement the transactions.
+//
+// What this does NOT cover:
+//   - sales/, purchases/, etc. — those collections do not exist yet.
+//     Future tickets MUST add per-collection match blocks that use the
+//     hasPermission() helper below. The catch-all at the bottom denies
+//     anything we haven't explicitly allowed, so forgetting is fail-closed.
+//
+// Defense-in-depth note: Desktop bypasses these rules entirely (Admin SDK),
+// so shared app logic is the *real* enforcement. These rules are the mobile
+// (Android/iOS) backstop and a sanity check against compromised tokens.
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- helpers ----------
+
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    // Custom claim set at admin creation. Set on the Firebase Auth token,
+    // available without a Firestore read.
+    function isAdmin() {
+      return isSignedIn() && request.auth.token.admin == true;
+    }
+
+    function isSelf(uid) {
+      return isSignedIn() && request.auth.uid == uid;
+    }
+
+    // Cross-project sanity check: the user's token MUST be from this project's
+    // company. Defends against an attacker pointing a stolen token at a
+    // different client's Firebase project.
+    function belongsToThisCompany() {
+      return isSignedIn()
+        && request.auth.token.hlCompanyId is string
+        && request.auth.token.hlCompanyId ==
+             get(/databases/$(database)/documents/companySettings/profile).data.hlCompanyId;
+    }
+
+    // Per-feature permission check, intended for future per-collection rules.
+    // `level` is one of "manage" | "view".
+    //   - "manage" grants write access (creators of sales/purchases/etc.)
+    //   - "view"   grants read access (and is implied by "manage")
+    // The user's permissions map is read from users/{uid}. One Firestore
+    // read per request; Firebase caches these inside a single eval.
+    function userPerms() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    }
+    function hasPermission(feature, level) {
+      return isSignedIn()
+        && userPerms().isActive == true
+        && (
+          // admins can do anything
+          isAdmin()
+          // or the explicit per-feature level
+          || userPerms().permissions[feature] == "manage"
+          || (level == "view" && userPerms().permissions[feature] == "view")
+        );
+    }
+
+    // ---------- users/{uid} ----------
+
+    match /users/{uid} {
+      // Read: own doc, or any admin.
+      allow get: if (isSelf(uid) || isAdmin()) && belongsToThisCompany();
+      allow list: if isAdmin() && belongsToThisCompany();
+
+      // Create + update: admin only.
+      // Field-level guard: only admins may set role == "admin" or userMgmt == true.
+      // isActive is admin-controlled (no self-deactivation).
+      allow create: if isAdmin()
+        && belongsToThisCompany()
+        && request.resource.data.email is string
+        && request.resource.data.role in ['admin', 'member']
+        && request.resource.data.isActive is bool
+        && request.resource.data.permissions is map;
+
+      allow update: if isAdmin()
+        && belongsToThisCompany()
+        // Email is immutable post-creation (changes go through Auth, not Firestore).
+        && (!('email' in request.resource.data.diff(resource.data).affectedKeys())
+            || request.resource.data.email == resource.data.email);
+
+      // Deletes are not supported — deactivate via isActive=false instead.
+      allow delete: if false;
+    }
+
+    // ---------- companySettings/profile (singleton) ----------
+    //
+    // Admins edit the tax rate and the invoice identity from the in-app Settings screen.
+    // The *binding* fields are not theirs to change: hlCompanyId is the Humble Ledger
+    // company every posting is addressed to, and currency is the unit every stored amount
+    // is already denominated in. Editing either would not convert anything — it would
+    // silently re-label history. Both are set at provisioning and only a Cloud Function
+    // (Admin SDK, bypasses these rules) may move them.
+
+    match /companySettings/{docId} {
+      allow read: if isSignedIn() && belongsToThisCompany();
+
+      allow create: if isAdmin() && belongsToThisCompany();
+
+      allow update: if isAdmin()
+        && belongsToThisCompany()
+        && request.resource.data.hlCompanyId == resource.data.hlCompanyId
+        && request.resource.data.currency == resource.data.currency;
+
+      // Deleting the profile would orphan the whole company: every rule below resolves
+      // its tenant through this document.
+      allow delete: if false;
+    }
+
+    // ---------- companySettingsChanges/{changeId} (append-only audit) ----------
+    //
+    // Who changed the tax rate, and to what. Its whole value is that it cannot be edited
+    // after the fact, so update and delete are closed to every client — including the
+    // admin who wrote the entry. A create must name its author honestly: `changedBy` is
+    // pinned to the caller's own uid, so an admin cannot log a change under someone else.
+    //
+    // Desktop writes these through the Admin SDK inside the same transaction as the
+    // profile write, and bypasses these rules; this is the mobile backstop.
+
+    match /companySettingsChanges/{changeId} {
+      allow get, list: if isAdmin() && belongsToThisCompany();
+
+      allow create: if isAdmin()
+        && belongsToThisCompany()
+        && request.resource.data.changedBy == request.auth.uid
+        && request.resource.data.field is string
+        && request.resource.data.newValue is string;
+
+      allow update, delete: if false;
+    }
+
+    // ---------- invites/{inviteId} ----------
+
+    match /invites/{inviteId} {
+      allow read, write: if isAdmin() && belongsToThisCompany();
+    }
+
+    // ---------- entities/{entityId} (Profiles / parties) ----------
+    //
+    // One unified party per doc (customer/supplier/middleman are non-binding
+    // roles). Balance is NOT stored here — it is read live from HL. The HL sync
+    // fields (hlCustomerId/hlAccountId/hlSyncedAt) and syncStatus=SYNCED are owned
+    // by the onEntityWrite Cloud Function (Admin SDK → bypasses these rules); the
+    // guards below only constrain untrusted mobile clients. Permission: `profiles`.
+
+    match /entities/{entityId} {
+      allow get, list: if hasPermission('profiles', 'view') && belongsToThisCompany();
+
+      // Create: a client may only start a party as PENDING, and may not forge the
+      // HL identity fields or mint the reserved Walk-in.
+      allow create: if hasPermission('profiles', 'manage')
+        && belongsToThisCompany()
+        && request.resource.data.name is string
+        && request.resource.data.isActive == true
+        && request.resource.data.isWalkIn == false
+        && request.resource.data.syncStatus == 'PENDING'
+        && !('hlCustomerId' in request.resource.data)
+        && !('hlAccountId' in request.resource.data);
+
+      // Update: Walk-in is immutable; the isWalkIn flag can't be flipped; clients
+      // can't touch the CF-owned HL fields, and can't forge SYNCED (only re-flag
+      // PENDING or leave it unchanged — the CF sets SYNCED/FAILED).
+      allow update: if hasPermission('profiles', 'manage')
+        && belongsToThisCompany()
+        && resource.data.isWalkIn == false
+        && request.resource.data.isWalkIn == resource.data.isWalkIn
+        && !request.resource.data.diff(resource.data).affectedKeys()
+             .hasAny(['hlCustomerId', 'hlAccountId', 'hlSyncedAt'])
+        && (request.resource.data.syncStatus == resource.data.syncStatus
+            || request.resource.data.syncStatus == 'PENDING');
+
+      // Soft-archive only (isActive=false via update). Never a hard delete.
+      allow delete: if false;
+    }
+
+    // ---------- Inventory (M4 · Brief #41) ----------
+    //
+    // Four collections gated on the caller's `inventory` permission (view→read,
+    // manage→write). Mobile (native SDK) is bound by these rules; Desktop (Admin
+    // SDK) BYPASSES them, so the shared AddStockUseCase + permission gates (T1) are
+    // the real enforcement there — these are the mobile backstop.
+    //
+    // Add-stock is one CLIENT transaction (docs/SCHEMA.md Part 2): create the SKU
+    // (products/{skuKey}) if absent, then per unit read imeiIndex/{imei} → if absent
+    // create serials/{autoId} + imeiIndex/{imei}, else abort as a duplicate. All the
+    // rules must do is PERMIT that multi-doc write for a `manage` user and DENY
+    // view/none. Products & serials are history-bearing → no hard delete (archive via
+    // isActive); imeiIndex is in-stock-only → delete IS allowed (released on sold/archive).
+
+    // products/{productId} — the SKU. productId == the deterministic skuKey (== doc id),
+    // which makes find-or-create atomic (no duplicate SKUs under concurrency).
+    match /products/{productId} {
+      allow get, list: if hasPermission('inventory', 'view') && belongsToThisCompany();
+
+      allow create: if hasPermission('inventory', 'manage')
+        && belongsToThisCompany()
+        && request.resource.data.productId == productId          // doc id IS the skuKey
+        && request.resource.data.trackingMode in ['SERIALIZED', 'QUANTITY', 'VARIANT', 'SERVICE']
+        && request.resource.data.defaultSellingPrice is string   // money is a decimal STRING
+        && request.resource.data.attributes is map
+        && request.resource.data.isActive == true;               // start active; archive via update
+
+      // In-place edits are limited to defaultSellingPrice + isActive (archive). productId,
+      // trackingMode, and the SKU-defining `attributes` map are IMMUTABLE: a wrong attribute
+      // is a DIFFERENT SKU, corrected by moving units + archiving the old product
+      // (docs/SCHEMA.md), never edited here — otherwise a product's attributes could
+      // contradict its own skuKey (== productId).
+      allow update: if hasPermission('inventory', 'manage')
+        && belongsToThisCompany()
+        && request.resource.data.defaultSellingPrice is string
+        && !request.resource.data.diff(resource.data).affectedKeys()
+             .hasAny(['productId', 'trackingMode', 'attributes']);
+
+      allow delete: if false;  // soft-archive via isActive=false, never a hard delete
+    }
+
+    // serials/{serialId} — one physical unit / one IMEI. The bridge to Sales.
+    match /serials/{serialId} {
+      allow get, list: if hasPermission('inventory', 'view') && belongsToThisCompany();
+
+      allow create: if hasPermission('inventory', 'manage')
+        && belongsToThisCompany()
+        && request.resource.data.serialId == serialId
+        && request.resource.data.productId is string && request.resource.data.productId != ''
+        && request.resource.data.imei is string && request.resource.data.imei != ''
+        && request.resource.data.cost is string                  // per-unit cost, decimal STRING
+        && request.resource.data.status in ['IN_STOCK', 'RESERVED', 'SOLD']
+        && request.resource.data.condition in ['NEW', 'USED'];
+
+      // In-place edits are limited to lifecycle/condition/cost/location. serialId,
+      // productId, imei and purchaseId are IMMUTABLE: a mistyped IMEI is fixed by VOIDING the unit
+      // (archive + release its imeiIndex) and re-adding a fresh unit, NOT by editing imei
+      // here — so the serial <-> imeiIndex pair can never desync from a direct update.
+      allow update: if hasPermission('inventory', 'manage')
+        && belongsToThisCompany()
+        && request.resource.data.serialId == resource.data.serialId
+        && request.resource.data.productId == resource.data.productId
+        && request.resource.data.imei == resource.data.imei
+        // Re-pointing a unit at another batch would let a reversal pull phones it never paid
+        // for, or leave the ones it did pay for behind (ticket #106).
+        && request.resource.data.get('purchaseId', null) == resource.data.get('purchaseId', null)
+        && request.resource.data.status in ['IN_STOCK', 'RESERVED', 'SOLD']
+        && request.resource.data.condition in ['NEW', 'USED']
+        && request.resource.data.cost is string;
+
+      allow delete: if false;  // status:SOLD + isActive kept separate; never a hard delete
+    }
+
+    // attributes/{attributeId} — managed vocabularies (brand/model/capacity/color/carrier/location).
+    // Empty-start by design: NO seed data. Vocabularies grow via add-new-inline
+    // (T1 AddAttributeUseCase). Do not pre-seed brands/carriers.
+    match /attributes/{attributeId} {
+      allow get, list: if hasPermission('inventory', 'view') && belongsToThisCompany();
+
+      allow create, update: if hasPermission('inventory', 'manage')
+        && belongsToThisCompany()
+        && request.resource.data.type in ['brand', 'model', 'capacity', 'color', 'carrier', 'location'];
+
+      allow delete: if false;  // soft-archive via isActive=false
+    }
+
+    // imeiIndex/{imei} — in-stock-only IMEI uniqueness guard. Doc id IS the imei.
+    // Created in the same txn as its serial; DELETED when the unit is sold/archived
+    // (releasing the IMEI to be re-added), so delete is permitted here.
+    match /imeiIndex/{imei} {
+      allow get, list: if hasPermission('inventory', 'view') && belongsToThisCompany();
+
+      allow create: if hasPermission('inventory', 'manage')
+        && belongsToThisCompany()
+        && request.resource.data.imei == imei;   // doc id must equal the imei field
+
+      allow delete: if hasPermission('inventory', 'manage') && belongsToThisCompany();
+
+      allow update: if false;  // corrections are delete(old)+create(new), never an in-place edit
+    }
+
+    // ---------- purchases/{purchaseId} (ticket #58) ----------
+    //
+    // A lightweight purchase captured at Add-Inventory time, written PENDING alongside
+    // the inventory transaction. The `onPurchaseWrite` Cloud Function (Admin SDK →
+    // bypasses these rules) posts to HL and owns syncStatus=SYNCED/FAILED + the HL fields.
+    //
+    // Gated on `inventory` (not `purchases`): the record is inseparable from adding the
+    // stock it pays for — RecordPurchaseUseCase gates on `inventory` MANAGE, so the rule
+    // must match, or a cashier who can add stock couldn't complete the save on mobile.
+    // A client may only START a record as PENDING and may never update or delete it.
+
+    match /purchases/{purchaseId} {
+      allow get, list: if hasPermission('inventory', 'view') && belongsToThisCompany();
+
+      allow create: if hasPermission('inventory', 'manage')
+        && belongsToThisCompany()
+        && request.resource.data.partyEntityId is string
+        && request.resource.data.partyEntityId != ''
+        && request.resource.data.totalCost is string   // money is a decimal STRING
+        && request.resource.data.cashPaid is string
+        && request.resource.data.bankPaid is string
+        && request.resource.data.unitCount is int      // how many phones it brought in (#106)
+        && request.resource.data.syncStatus == 'PENDING'
+        && !('hlSyncedAt' in request.resource.data)
+        // A batch starts on the books. Everything the reversal writes is CF-owned, so a client
+        // must not be able to mint one that already claims to be reversed, or one carrying
+        // forged ledger ids that a later reversal would then try to reverse.
+        && (!('status' in request.resource.data) || request.resource.data.status == 'ACTIVE')
+        && !('reversalStatus' in request.resource.data)
+        && !('reversedAt' in request.resource.data)
+        && !('hlReversalTxnIds' in request.resource.data)
+        && !('hlPurchaseTxnId' in request.resource.data)
+        && !('hlPayoutCashTxnId' in request.resource.data)
+        && !('hlPayoutBankTxnId' in request.resource.data);
+
+      // CF-owned after creation; never edited by a client. Mobile asks for a reversal through the
+      // `reverseStockBatch` callable, which re-checks the caller is an admin server-side — the
+      // same shape as voiding a sale. Desktop's Admin SDK bypasses these rules and writes the
+      // request fields directly.
+      allow update, delete: if false;
+    }
+
+    // ---------- sales/{saleId} (ticket #61) ----------
+    //
+    // A completed sale, written PENDING inside the same transaction that marks its units
+    // sold. The `onSaleWrite` Cloud Function (Admin SDK → bypasses these rules) posts to HL
+    // and owns syncStatus=SYNCED/FAILED + the HL fields. A client may only START a record as
+    // PENDING and may never update or delete it. Gated on `sales` (view to read, manage to
+    // create) — matching RecordSaleUseCase.
+
+    match /sales/{saleId} {
+      allow get, list: if hasPermission('sales', 'view') && belongsToThisCompany();
+
+      allow create: if hasPermission('sales', 'manage')
+        && belongsToThisCompany()
+        && request.resource.data.customerEntityId is string
+        && request.resource.data.customerEntityId != ''
+        && request.resource.data.subtotal is string      // money is a decimal STRING
+        && request.resource.data.grandTotal is string
+        && request.resource.data.amountPaid is string
+        && request.resource.data.syncStatus == 'PENDING'
+        && !('hlSyncedAt' in request.resource.data)
+        // Invoice fields are CF-owned (ticket #76, #77) — a client may NEVER seed them.
+        && !request.resource.data.keys().hasAny([
+             'invoiceNumber', 'invoiceUrl', 'invoiceStatus', 'invoiceIssuedAt', 'invoiceError',
+             'invoiceAttempts', 'invoiceRetryRequestedAt'
+           ])
+        // Walk-in buyer capture is the only invoice-adjacent field a client may set (UI in T2).
+        // Absent, a string, or explicit null are all allowed (SCHEMA lists them as `string | null`).
+        && (!('buyerName' in request.resource.data)
+             || request.resource.data.buyerName is string
+             || request.resource.data.buyerName == null)
+        && (!('buyerPhone' in request.resource.data)
+             || request.resource.data.buyerPhone is string
+             || request.resource.data.buyerPhone == null)
+        // Tax-inclusive pricing snapshot (ticket #106) — client-owned. taxInclusive records how the
+        // sale was priced (a boolean); buyerTaxNumber is the buyer's snapshotted tax number
+        // (string | null). Both optional; absent reads as tax-exclusive / no number.
+        && (!('taxInclusive' in request.resource.data)
+             || request.resource.data.taxInclusive is bool)
+        && (!('buyerTaxNumber' in request.resource.data)
+             || request.resource.data.buyerTaxNumber is string
+             || request.resource.data.buyerTaxNumber == null)
+        // Denormalized balance flag for Sales History filtering (ticket #83) — client-owned
+        // (unlike the CF-owned invoice* fields): computed with Money where balanceRemaining is,
+        // since money is a string and Firestore can't inequality-query it. Must be a boolean.
+        && (!('hasOutstandingBalance' in request.resource.data)
+             || request.resource.data.hasOutstandingBalance is bool);
+
+      // Void request (ticket #85): an **admin** may set exactly the void REQUEST fields on an
+      // existing sale to ask the `onSaleWrite` CF to reverse it. Every other field is immutable to
+      // the client, and the CF-owned void fields stay the CF's alone (voidStatus can only be set to
+      // PENDING here; voidedAt/voidError/hlVoidTxnId/hlRefundIds and `status` are never client-set).
+      // This is the one update a client may ever make to a sale doc — deletes stay forbidden (a sale
+      // is reversed, never removed). Mobile can't reach this (no sale-doc write); Desktop's Admin SDK
+      // bypasses rules entirely, so the CF re-verifies admin server-side regardless.
+      //
+      // NOTE — two "admin" sources of truth: this rule gates on the Auth custom claim
+      // (`isAdmin()` == `request.auth.token.admin`), while `voidSaleCore` re-checks
+      // `users/{uid}.role == 'admin'`. They MUST be provisioned together (claim + user doc). Today no
+      // production void path exercises this rule (mobile uses the `voidSale` callable → the CF's
+      // role check; Desktop bypasses rules), but a future mobile doc-write void would rely on both
+      // agreeing — keep the claim and the user-doc role in lockstep, or align both on the same source.
+      allow update: if isAdmin()
+        && belongsToThisCompany()
+        && resource.data.status != 'VOIDED'                 // an already-voided sale is final
+        && request.resource.data.diff(resource.data).affectedKeys()
+             .hasOnly(['voidReason', 'voidRequestedBy', 'voidRequestedAt', 'voidStatus', 'updatedAt'])
+        && request.resource.data.voidStatus == 'PENDING'    // client may only START a void
+        && request.resource.data.voidReason is string
+        && request.resource.data.voidReason != ''           // a reason is required
+        && request.resource.data.voidRequestedBy == request.auth.uid;
+
+      allow delete: if false; // a sale is reversed (VOIDED), never deleted
+    }
+
+    // ---------- money movements (ticket #90) ----------
+    //
+    // The rebuilt transactions screen: money between any two accounts (a party, Cash, or Bank).
+    // Same dual-write spine as sales/purchases — a client may only START an entry as PENDING and
+    // may never update or delete it; the `onMoneyEntryWrite` Cloud Function owns syncStatus and
+    // every hl* field from then on.
+    //
+    // No balance is stored anywhere here, by design. The legacy app kept a running balance on each
+    // party and mutated it from the client, so a lost or duplicated write left a permanently wrong
+    // number with nothing to check it against. Balances are read from Humble Ledger instead.
+
+    match /moneyEntries/{entryId} {
+      allow get, list: if hasPermission('transactions', 'view') && belongsToThisCompany();
+
+      allow create: if hasPermission('transactions', 'manage')
+        && belongsToThisCompany()
+        && request.resource.data.amount is string       // money is a decimal STRING
+        && request.resource.data.syncStatus == 'PENDING'
+        // Both sides must be a recognised account, and a PARTY must name its entity.
+        && request.resource.data.from.kind in ['PARTY', 'CASH', 'BANK']
+        && request.resource.data.to.kind in ['PARTY', 'CASH', 'BANK']
+        && (request.resource.data.from.kind != 'PARTY'
+             || (request.resource.data.from.entityId is string
+                  && request.resource.data.from.entityId != ''))
+        && (request.resource.data.to.kind != 'PARTY'
+             || (request.resource.data.to.entityId is string
+                  && request.resource.data.to.entityId != ''))
+        // CF-owned — a client may never seed the ledger link, the sync outcome, or either side of
+        // a reversal link. `reversesEntryId` matters as much as `reversedByEntryId`: an entry that
+        // claims to be a reversal is HIDDEN from both the Money table and the party statement, so a
+        // client able to set it could post real money that appears in neither.
+        && !request.resource.data.keys().hasAny([
+             'hlTransactionId', 'hlSyncedAt', 'hlSyncError',
+             'reversedByEntryId', 'reversesEntryId'
+           ]);
+
+      // CF-owned after creation; a mistake is corrected by reversing, never by editing.
+      //
+      // Reversal marks the original with `reversedByEntryId`, which a rules-enforced client
+      // therefore cannot do. Desktop's Admin SDK bypasses rules and does it in one transaction
+      // with the reversing entry's creation — atomic, so a double-click can't post two reversals.
+      // A phone client would need a callable for this; out of scope while this is Desktop-only.
+      allow update, delete: if false;
+    }
+
+    // ---------- commissionRules/{ruleId} (ticket #97) ----------
+    //
+    // Admin-managed standing arrangements (location → payee → per-unit or percent-of-cost).
+    // A rule silently creates money owed on every future intake — a settings-grade act — so
+    // **writing** one is admin-only (mirrors the SaveCommissionRuleUseCase gate on role == ADMIN).
+    // **Reading** is `inventory` view, not admin: the cashier who adds stock must see the
+    // commission a rule proposes and confirm it at intake, even though only an admin edits the
+    // rule (ObserveActiveCommissionRulesUseCase). The admin-only management screen is gated
+    // in-app. Never hard-deleted; switching a rule off is an isActive=false update.
+    // (Desktop's Admin SDK bypasses these rules; the use cases are the authority there.)
+
+    match /commissionRules/{ruleId} {
+      allow get, list: if hasPermission('inventory', 'view') && belongsToThisCompany();
+
+      allow create, update: if isAdmin()
+        && belongsToThisCompany()
+        && request.resource.data.locationAttributeId is string
+        && request.resource.data.locationAttributeId != ''
+        && request.resource.data.payeeEntityId is string
+        && request.resource.data.payeeEntityId != ''
+        && request.resource.data.rateKind in ['PER_UNIT', 'PERCENT_OF_COST']
+        && request.resource.data.rate is string        // rate is a decimal STRING
+        && request.resource.data.isActive is bool;
+
+      allow delete: if false; // switched off (isActive=false), never removed
+    }
+
+    // ---------- commissions/{commissionId} (ticket #97) ----------
+    //
+    // One payee's commission from one Add-Inventory batch, written PENDING **in the same
+    // transaction as the stock and its purchase** (never stock without its commission
+    // obligation). The `onCommissionWrite` Cloud Function (Admin SDK → bypasses these rules)
+    // posts to HL and owns syncStatus=SYNCED/FAILED + the hl* fields. Gated on `inventory`
+    // (not a commission scope): the record is inseparable from adding the stock that earned it,
+    // exactly like purchases. A client may only START a record as PENDING and never update/delete.
+
+    match /commissions/{commissionId} {
+      allow get, list: if hasPermission('inventory', 'view') && belongsToThisCompany();
+
+      allow create: if hasPermission('inventory', 'manage')
+        && belongsToThisCompany()
+        && request.resource.data.payeeEntityId is string
+        && request.resource.data.payeeEntityId != ''
+        && request.resource.data.locationAttributeId is string
+        && request.resource.data.locationAttributeId != ''
+        && request.resource.data.amount is string      // money is a decimal STRING
+        && request.resource.data.basisAmount is string
+        && request.resource.data.paidCash is string     // give-now split (cash), "0" when none
+        && request.resource.data.paidBank is string     // give-now split (bank), "0" when none
+        && request.resource.data.unitCount is int
+        && request.resource.data.syncStatus == 'PENDING'
+        && !request.resource.data.keys().hasAny(['hlTransactionId', 'hlSyncedAt', 'hlSyncError']);
+
+      allow update, delete: if false; // CF-owned after creation; never edited by a client
+    }
+
+    // ---------- catch-all: deny ----------
+    //
+    // Anything not matched above is denied. This is the safety net.
+    // Future per-feature collections (sales, purchases, etc.) MUST add their
+    // own match blocks ABOVE this; they should call hasPermission(feature, level)
+    // and belongsToThisCompany().
+
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}

@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Dev-only cleartext exception for the Aromex gateway during M1 closed testing.
+
+  Why this exists:
+    The gateway is currently served over plain HTTP at 68.183.86.89 (ticket #4
+    Phase A). Android 9+ blocks cleartext by default. Phase B (Let's Encrypt +
+    a real domain) is documented in aromex-gateway/docs/DEPLOY.md but not yet
+    executed.
+
+  Scope: cleartext is permitted ONLY for the gateway host. Everything else
+  (Firebase, HL, future origins) must be HTTPS.
+
+  TODO(M1-04 Phase B): remove this file and the `android:networkSecurityConfig`
+  attribute from AndroidManifest.xml the moment the gateway is on HTTPS.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">68.183.86.89</domain>
+    </domain-config>
+</network-security-config>

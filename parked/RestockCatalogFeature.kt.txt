@@ -1,0 +1,903 @@
+PARKED FEATURE — Desktop "Restock catalog" / Add-units-to-existing-phone
+========================================================================
+
+This is the full, working (compiled) implementation of the desktop inventory
+"restock catalog": a document-style Brand → Model → SKU tree of every phone
+(including zero-stock SKUs), where each SKU row has an "Add unit" button that
+opens the add dialog pre-filled with that SKU's specs. Units — from existing
+phones AND from "New phone" — accumulate into one batch, confirmed together.
+
+It was removed from the live screen on request (to be re-implemented elsewhere).
+Everything below is preserved verbatim so it can be lifted into the new location.
+
+Files it touched:
+  - desktopApp/.../ui/inventory/InventoryListViewModel.kt   (data + build)
+  - desktopApp/.../ui/inventory/InventoryScreen.kt           (UI + wiring)
+
+Design notes:
+  - The catalog is built from the PRODUCT catalog (not live serials), so a phone
+    at 0 in stock still appears (its product doc / "connection" already exists).
+  - Pre-fill uses AddStockViewModel.setPickedFromUnit(attributes, price) — specs
+    land EDITABLE in the dialog; buildStockGroups find-or-creates by SkuKey.
+  - "New phone" clears ONLY the picker via setPickedFromUnit(emptyMap(), "") so
+    the staged batch survives; its unit joins the same list.
+  - Reuses browse-table primitives that live in InventoryScreen.kt: tree consts
+    (BRAND_TRUNK_X, MODEL_TRUNK_X_OFFSET, TREE_STROKE_DP, TREE_CORNER_DP,
+    TREE_ICON_CLEARANCE, TREE_VERTICAL_CLEARANCE, BRAND_PREFIX, MODEL_PREFIX),
+    and composables BrowseCell / BrowseCellTooltip / BrowseHeaderCell / MoneyCell /
+    CompactSearchField.
+
+
+================================================================================
+PART 1 — InventoryListViewModel.kt
+================================================================================
+
+--- 1a. Data types — add after `data class BrandGroup { ... }` ---
+
+/**
+ * One SKU (product) leaf in the restock catalog — the "add units to an existing phone" screen.
+ * Unlike [BrowseUnit] (a live serial), a catalog SKU is the product doc itself, so it appears
+ * even when [inStockCount] is 0 — a phone whose stock ran out still has its "connection" (its
+ * product) and can be restocked in two fields.
+ */
+data class CatalogSku(
+    val product: Product,
+    val capacity: String,
+    val color: String,
+    val carrier: String,
+    val sellingPrice: String,
+    val inStockCount: Int,
+)
+
+data class CatalogModel(val modelName: String, val skus: List<CatalogSku>)
+
+data class CatalogBrand(val brandName: String, val models: List<CatalogModel>) {
+    val totalModels: Int get() = models.size
+    val totalSkus: Int get() = models.sumOf { it.skus.size }
+}
+
+--- 1b. UI state — add these fields to InventoryListUiState (before `summary`) ---
+
+    // Restock catalog (Brand → Model → SKU) built from the product catalog, incl. zero-stock SKUs.
+    // [catalogGroups] respects the search query; [allCatalogGroups] is the full set for column sizing.
+    val catalogGroups: List<CatalogBrand> = emptyList(),
+    val allCatalogGroups: List<CatalogBrand> = emptyList(),
+
+--- 1c. recompute() — build + emit. Insert just before the `_uiState.update { ... }`
+        that copies rows/browseGroups, and add the two fields to that copy(...).
+        (`countByProduct` is already computed earlier in recompute().) ---
+
+        // --- Restock catalog (Brand → Model → SKU), incl. zero-stock SKUs ---
+        // Built from the product catalog, not from live serials, so a phone that dropped to
+        // zero still shows up and can be restocked. Only active products (an archived SKU is
+        // not something you restock). Query-filtered for display; full set for stable columns.
+        val activeProducts = products.filter { it.isActive }
+        val catalogGroups = buildCatalogGroups(activeProducts.filter { matches(it, query) }, countByProduct)
+        val allCatalogGroups = buildCatalogGroups(activeProducts, countByProduct)
+
+        // ...then in the _uiState.update { it.copy(...) } add:
+        //     catalogGroups = catalogGroups,
+        //     allCatalogGroups = allCatalogGroups,
+
+--- 1d. Helper — add as a private method on the ViewModel ---
+
+    /** Groups the product catalog into the Brand → Model → SKU tree the restock screen renders. */
+    private fun buildCatalogGroups(
+        prods: List<Product>,
+        countByProduct: Map<String, Int>,
+    ): List<CatalogBrand> =
+        prods
+            .groupBy { it.attributes[AttributeType.BRAND]?.name ?: "Unknown" }
+            .entries.sortedBy { it.key.lowercase() }
+            .map { (brand, brandProducts) ->
+                CatalogBrand(
+                    brandName = brand,
+                    models = brandProducts
+                        .groupBy { it.attributes[AttributeType.MODEL]?.name ?: "Unknown" }
+                        .entries.sortedBy { it.key.lowercase() }
+                        .map { (model, modelProducts) ->
+                            CatalogModel(
+                                modelName = model,
+                                skus = modelProducts
+                                    .map { p ->
+                                        CatalogSku(
+                                            product = p,
+                                            capacity = p.attributes[AttributeType.CAPACITY]?.name.orEmpty(),
+                                            color = p.attributes[AttributeType.COLOR]?.name.orEmpty(),
+                                            carrier = p.attributes[AttributeType.CARRIER]?.name.orEmpty(),
+                                            sellingPrice = p.defaultSellingPrice,
+                                            inStockCount = countByProduct[p.productId] ?: 0,
+                                        )
+                                    }
+                                    .sortedWith(
+                                        compareBy({ it.capacity.lowercase() }, { it.color.lowercase() }, { it.carrier.lowercase() }),
+                                    ),
+                            )
+                        },
+                )
+            }
+
+
+================================================================================
+PART 2 — InventoryScreen.kt  (wiring)
+================================================================================
+
+--- 2a. Mode — add to the sealed interface Mode ---
+
+    // Restock catalog — the document-style tree of existing phones (incl. zero-stock), each with
+    // an "Add unit" button that opens the add dialog pre-filled with that SKU's specs.
+    data object Restock : Mode
+
+--- 2b. Root state — add near `var mode by remember { ... }` ---
+
+    // When entering Add mode from the restock catalog (or "New phone"), the add dialog should
+    // pop open straight away, pre-filled — instead of landing on the empty review table first.
+    var addOpensDialog by remember { mutableStateOf(false) }
+
+--- 2c. InventoryTopBar callbacks (Mode.List branch) — repoint Add stock to the catalog ---
+
+    onAddStock = { addVm.reset(); mode = Mode.Restock },
+    onPaste = { addVm.reset(); addVm.openPaste(); addOpensDialog = false; mode = Mode.Add },
+
+--- 2d. Mode.Add branch — pass the auto-open flag to AddStockPanel ---
+
+    AddStockPanel(
+        addVm = addVm,
+        state = addState,
+        existingProducts = listState.rows.map { it.product },
+        openDialogInitially = addOpensDialog,
+    )
+
+--- 2e. Mode.Restock branch — add to the `when (val m = mode) { ... }` ---
+
+                    Mode.Restock -> {
+                        // The add-unit dialog opens OVER the catalog (this product = open), so the
+                        // catalog stays visible behind the scrim. Saved units accumulate in the
+                        // review batch; a "Review" bar takes you to confirm them.
+                        var restockProduct by remember { mutableStateOf<com.humblesolutions.aromex.model.Product?>(null) }
+                        // "New phone" opens the same dialog with a blank picker — its unit(s) join
+                        // the SAME batch as the per-row "Add unit", never a separate one.
+                        var showNewPhoneDialog by remember { mutableStateOf(false) }
+                        // Transient "✓ added" confirmation shown on the catalog after a save.
+                        var addedMessage by remember { mutableStateOf<String?>(null) }
+                        RestockTopBar(
+                            sidebarExpanded = isSidebarExpanded,
+                            onExpandSidebar = { isSidebarExpanded = true },
+                            canManage = listState.canManage,
+                            onClose = { mode = Mode.List },
+                            onNewPhone = {
+                                // Clear only the picker (keep the staged batch), then open the
+                                // blank dialog over the catalog so this phone joins the same list.
+                                addVm.setPickedFromUnit(emptyMap(), "")
+                                showNewPhoneDialog = true
+                            },
+                            onPaste = { addVm.reset(); addVm.openPaste(); addOpensDialog = false; mode = Mode.Add },
+                        )
+                        HorizontalDivider(color = colors.border)
+                        Box(Modifier.fillMaxSize()) {
+                            RestockCatalogPanel(
+                                listVm = listVm,
+                                state = listState,
+                                stagedCount = addState.reviewUnits.size,
+                                addedMessage = addedMessage,
+                                onAddedMessageShown = { addedMessage = null },
+                                onReview = { addOpensDialog = false; mode = Mode.Add },
+                                onAddUnit = { product ->
+                                    // Pre-fill the picker with this SKU's specs (editable), then
+                                    // open the dialog over the catalog. Don't reset — units staged
+                                    // for other phones must survive across dialogs.
+                                    addVm.setPickedFromUnit(product.attributes, product.defaultSellingPrice)
+                                    restockProduct = product
+                                },
+                            )
+                            if (restockProduct != null || showNewPhoneDialog) {
+                                AddUnitDialog(
+                                    addVm = addVm,
+                                    state = addState,
+                                    existingProducts = listState.rows.map { it.product },
+                                    onDismiss = { restockProduct = null; showNewPhoneDialog = false },
+                                    onSave = { units ->
+                                        units.forEach { addVm.addReviewUnit(it) }
+                                        restockProduct = null
+                                        showNewPhoneDialog = false
+                                        addedMessage = if (units.size == 1) "1 unit added to the batch"
+                                        else "${units.size} units added to the batch"
+                                    },
+                                )
+                            }
+                        }
+                    }
+
+--- 2f. Mode.Drill branch — the "Add units" onAddUnits gained `addOpensDialog = true` ---
+
+                            onAddUnits = {
+                                if (product != null) {
+                                    addVm.reset()
+                                    addVm.startAddUnits(product.productId, product.attributes, product.defaultSellingPrice)
+                                    addOpensDialog = true
+                                    mode = Mode.Add
+                                }
+                            },
+
+--- 2g. AddStockPanel — added the `openDialogInitially` param + seeded showAddDialog ---
+
+    private fun AddStockPanel(
+        addVm: AddStockViewModel,
+        state: AddStockUiState,
+        existingProducts: List<Product>,
+        openDialogInitially: Boolean = false,
+    ) {
+        ...
+        // Dialog visibility state. Seeded from [openDialogInitially] so arriving here from the
+        // restock catalog / "New phone" / "Add units" pops the pre-filled dialog straight open.
+        var showAddDialog by remember { mutableStateOf(openDialogInitially) }
+
+
+================================================================================
+PART 3 — InventoryScreen.kt  (composables)
+================================================================================
+
+--- 3a. RestockTopBar (placed near AddInventoryTopBar / DrillTopBar) ---
+
+/**
+ * Top bar for the restock catalog: title + "New phone" (brand-new SKU) + "Paste" + close.
+ * Mirrors [InventoryTopBar]'s compact behaviour so buttons drop their labels on a narrow window.
+ */
+@Composable
+private fun RestockTopBar(
+    sidebarExpanded: Boolean,
+    onExpandSidebar: () -> Unit,
+    canManage: Boolean,
+    onClose: () -> Unit,
+    onNewPhone: () -> Unit,
+    onPaste: () -> Unit,
+) {
+    val colors = AromexTheme.colors
+    val dims = AromexTheme.dimensions
+    BoxWithConstraints(Modifier.fillMaxWidth()) {
+        val compact = maxWidth < TOP_BAR_COMPACT_BREAKPOINT
+        Row(
+            modifier = Modifier.fillMaxWidth().background(colors.surface)
+                .padding(horizontal = dims.space20, vertical = 12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(dims.space16),
+        ) {
+            if (!sidebarExpanded) {
+                IconButton(onClick = onExpandSidebar) {
+                    Icon(Icons.Filled.Menu, "Expand menu", tint = colors.textSecondary)
+                }
+            }
+            IconButton(onClick = onClose, modifier = Modifier.pointerHoverIcon(PointerIcon.Hand)) {
+                Icon(Icons.Filled.Close, strings(Strings.inventory_back_cd), tint = colors.textSecondary)
+            }
+            Text(
+                "Add units — pick a phone",
+                style = AromexTheme.typography.sectionTitle,
+                color = colors.textPrimary,
+                modifier = Modifier.weight(1f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (canManage) {
+                OutlinedButton(
+                    onClick = onPaste,
+                    modifier = Modifier.height(dims.buttonHeight).pointerHoverIcon(PointerIcon.Hand),
+                    shape = RoundedCornerShape(dims.radiusButton),
+                    contentPadding = if (compact) PaddingValues(horizontal = 12.dp) else ButtonDefaults.ContentPadding,
+                ) {
+                    Icon(
+                        Icons.Filled.ContentPaste,
+                        contentDescription = if (compact) strings(Strings.inventory_paste_button) else null,
+                        modifier = Modifier.size(16.dp),
+                        tint = colors.brand,
+                    )
+                    if (!compact) {
+                        Spacer(Modifier.width(6.dp))
+                        Text(strings(Strings.inventory_paste_button), style = AromexTheme.typography.button, softWrap = false, color = colors.brand)
+                    }
+                }
+                Button(
+                    onClick = onNewPhone,
+                    modifier = Modifier.height(dims.buttonHeight).pointerHoverIcon(PointerIcon.Hand),
+                    shape = RoundedCornerShape(dims.radiusButton),
+                    colors = ButtonDefaults.buttonColors(containerColor = colors.brand, contentColor = Color.White),
+                    contentPadding = if (compact) PaddingValues(horizontal = 12.dp) else ButtonDefaults.ContentPadding,
+                ) {
+                    Icon(Icons.Filled.Add, contentDescription = if (compact) "New phone" else null, modifier = Modifier.size(18.dp))
+                    if (!compact) {
+                        Spacer(Modifier.width(6.dp))
+                        Text("New phone", style = AromexTheme.typography.button, softWrap = false)
+                    }
+                }
+            }
+        }
+    }
+}
+
+--- 3b. Catalog table block (columns + panel + table + rows) ---
+
+// ── Restock catalog — document-style tree of existing phones (incl. zero-stock) ──
+//
+// A near-exact copy of the browse table (same KPI-less top, same Brand → Model tree, same
+// chevrons/connectors, same auto-fit columns + slack distribution, same window-resize safety),
+// but the leaf is a SKU (not an IMEI): IMEI/cost/location/condition columns are gone, and the
+// row ends with an "Add unit" button that opens the add dialog pre-filled with that SKU's specs.
+
+/** Catalog column widths — brand/model/spec columns + a fixed trailing action column. */
+private data class CatalogColumns(
+    val brand: Dp,
+    val model: Dp,
+    val capacity: Dp,
+    val color: Dp,
+    val carrier: Dp,
+    val price: Dp,
+    val action: Dp,
+    val brandHeaderStartPad: Dp,
+    val modelHeaderStartPad: Dp,
+)
+
+private val LocalCatalogColumns = compositionLocalOf<CatalogColumns> {
+    error("LocalCatalogColumns not provided — read it from within CatalogGroupedTable's subtree")
+}
+
+/** Fixed width of the trailing "N in stock  [Add unit]" action column. */
+private val CATALOG_ACTION_WIDTH = 168.dp
+
+/**
+ * Measures the real text every catalog cell renders (across the full unfiltered [groups]) plus
+ * each header, and returns each column's content-safe width — same technique as
+ * [rememberAutoFitColumns], so widths stay put while the user searches instead of jumping.
+ */
+@Composable
+private fun rememberCatalogColumns(groups: List<CatalogBrand>): CatalogColumns {
+    val density = LocalDensity.current
+    val textMeasurer = rememberTextMeasurer()
+    val hint = AromexTheme.typography.hint
+
+    val brandHeader = "BRAND"
+    val modelHeader = "MODEL"
+    val capHeader = strings(Strings.inventory_col_capacity)
+    val colorHeader = strings(Strings.inventory_color_label)
+    val carrierHeader = strings(Strings.inventory_carrier_label)
+    val priceHeader = strings(Strings.inventory_col_sell_price)
+
+    return remember(groups, density, hint) {
+        val headerStyle = hint.copy(fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+        val brandStyle = hint.copy(fontSize = 13.sp, fontWeight = FontWeight.Bold)
+        val modelStyle = hint.copy(fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
+        val bodyStyle = hint.copy(fontSize = 12.sp)
+        val safety = 4.dp
+
+        fun widthOf(text: String, style: TextStyle): Dp {
+            val px = textMeasurer.measure(AnnotatedString(text), style).size.width
+            return with(density) { px.toDp() } + safety
+        }
+
+        val allSkus = groups.flatMap { b -> b.models.flatMap { it.skus } }
+        fun maxOfBody(values: Collection<String>, style: TextStyle): Dp =
+            values.maxOfOrNull { widthOf(it, style) } ?: 0.dp
+
+        val cellPad = 4.dp + 8.dp
+        val moneyPad = 6.dp + 8.dp
+        val dollarW = widthOf("$", bodyStyle)
+
+        val brandTextW = maxOf(
+            groups.maxOfOrNull { widthOf(it.brandName.uppercase(), brandStyle) } ?: 0.dp,
+            widthOf(brandHeader, headerStyle),
+        )
+        val modelTextW = maxOf(
+            groups.flatMap { it.models }.maxOfOrNull { widthOf(it.modelName, modelStyle) } ?: 0.dp,
+            widthOf(modelHeader, headerStyle),
+        )
+        val capW = maxOf(maxOfBody(allSkus.map { it.capacity }, bodyStyle), widthOf(capHeader, headerStyle)) + cellPad
+        val colorW = maxOf(maxOfBody(allSkus.map { it.color }, bodyStyle), widthOf(colorHeader, headerStyle)) + cellPad
+        val carrierW = maxOf(maxOfBody(allSkus.map { it.carrier }, bodyStyle), widthOf(carrierHeader, headerStyle)) + cellPad
+        val priceW = maxOf(dollarW + maxOfBody(allSkus.map { it.sellingPrice }, bodyStyle), widthOf(priceHeader, headerStyle)) + moneyPad
+
+        CatalogColumns(
+            brand = brandTextW + BRAND_PREFIX + 10.dp,
+            model = modelTextW + MODEL_PREFIX + 10.dp,
+            capacity = capW,
+            color = colorW,
+            carrier = carrierW,
+            price = priceW,
+            action = CATALOG_ACTION_WIDTH,
+            brandHeaderStartPad = BRAND_PREFIX,
+            modelHeaderStartPad = MODEL_PREFIX,
+        )
+    }
+}
+
+/** Distributes leftover width to Color/Carrier (the descriptive columns) — same as the browse table. */
+private fun CatalogColumns.withSlackDistributed(availableWidth: Dp): CatalogColumns {
+    val total = brand + model + capacity + color + carrier + price + action
+    val slack = availableWidth - total
+    if (slack <= 0.dp) return this
+    val share = slack / 2
+    return copy(color = color + share, carrier = carrier + share)
+}
+
+@Composable
+private fun RestockCatalogPanel(
+    listVm: InventoryListViewModel,
+    state: InventoryListUiState,
+    stagedCount: Int,
+    addedMessage: String?,
+    onAddedMessageShown: () -> Unit,
+    onReview: () -> Unit,
+    onAddUnit: (Product) -> Unit,
+) {
+    val colors = AromexTheme.colors
+    val dims = AromexTheme.dimensions
+    // Auto-dismiss the "✓ added" confirmation after a short beat.
+    LaunchedEffect(addedMessage) {
+        if (addedMessage != null) {
+            kotlinx.coroutines.delay(2500)
+            onAddedMessageShown()
+        }
+    }
+    Column(Modifier.fillMaxSize()) {
+            // ✓ confirmation banner — reassures the user the unit landed in the batch.
+            if (addedMessage != null) {
+                Row(
+                    modifier = Modifier.fillMaxWidth()
+                        .background(colors.brand.copy(alpha = 0.12f))
+                        .padding(horizontal = dims.space16, vertical = dims.space8),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    Icon(Icons.Filled.Check, null, tint = colors.brand, modifier = Modifier.size(16.dp))
+                    Text(
+                        addedMessage,
+                        style = AromexTheme.typography.hint.copy(fontWeight = FontWeight.SemiBold),
+                        color = colors.brand,
+                    )
+                }
+            }
+            // Search-only top strip (no location filter — a SKU isn't location-scoped).
+            Row(
+                modifier = Modifier.fillMaxWidth().background(colors.surfaceAlt)
+                    .padding(horizontal = dims.space16, vertical = dims.space12),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(dims.space8),
+            ) {
+                Text(
+                    "Pick a phone, then press Add unit — you'll only enter the IMEI and cost.",
+                    style = AromexTheme.typography.hint,
+                    color = colors.textSecondary,
+                    modifier = Modifier.weight(1f),
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                CompactSearchField(
+                    value = state.query,
+                    onValueChange = listVm::onQueryChange,
+                    modifier = Modifier.width(220.dp),
+                )
+            }
+            HorizontalDivider(color = colors.border)
+            CatalogGroupedTable(
+                state = state,
+                onAddUnit = onAddUnit,
+                modifier = Modifier.weight(1f).fillMaxWidth(),
+            )
+
+            // Docked "Review" bar — a real bottom bar (part of the layout, not floating over the
+            // table) so it never covers the last rows. Appears once at least one unit is staged;
+            // the full-width button makes it unmistakable where to go next.
+            if (stagedCount > 0) {
+                HorizontalDivider(color = colors.border)
+                Box(Modifier.fillMaxWidth().background(colors.surface).padding(dims.space16)) {
+                    Button(
+                        onClick = onReview,
+                        modifier = Modifier.fillMaxWidth()
+                            .height(dims.buttonHeight)
+                            .pointerHoverIcon(PointerIcon.Hand),
+                        shape = RoundedCornerShape(dims.radiusButton),
+                        colors = ButtonDefaults.buttonColors(containerColor = colors.brand, contentColor = Color.White),
+                    ) {
+                        Icon(Icons.Filled.Check, null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(dims.space8))
+                        Text(
+                            if (stagedCount == 1) "Review & confirm — 1 unit added"
+                            else "Review & confirm — $stagedCount units added",
+                            style = AromexTheme.typography.button,
+                            softWrap = false,
+                        )
+                    }
+                }
+            }
+    }
+}
+
+@Composable
+private fun CatalogGroupedTable(
+    state: InventoryListUiState,
+    onAddUnit: (Product) -> Unit,
+    modifier: Modifier,
+) {
+    val colors = AromexTheme.colors
+    val dims = AromexTheme.dimensions
+
+    var expandedBrands by remember { mutableStateOf(setOf<String>()) }
+    var expandedModels by remember { mutableStateOf(setOf<String>()) }
+    fun modelKey(brandName: String, modelName: String) = "$brandName/$modelName"
+
+    val allBrandNames = state.catalogGroups.map { it.brandName }.toSet()
+    val allModelKeys = state.catalogGroups.flatMap { b -> b.models.map { modelKey(b.brandName, it.modelName) } }.toSet()
+    val allExpanded = allBrandNames.isNotEmpty() && allBrandNames.all { it in expandedBrands }
+
+    val autoFitColumns = rememberCatalogColumns(state.allCatalogGroups)
+
+    BoxWithConstraints(modifier) {
+        val columns = remember(autoFitColumns, maxWidth) { autoFitColumns.withSlackDistributed(maxWidth) }
+        CompositionLocalProvider(LocalCatalogColumns provides columns) {
+            Column(Modifier.fillMaxSize()) {
+                Row(
+                    modifier = Modifier.fillMaxWidth().background(colors.surface)
+                        .padding(horizontal = dims.space16, vertical = dims.space8),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Spacer(Modifier.weight(1f))
+                    TextButton(
+                        onClick = {
+                            if (allExpanded) {
+                                expandedBrands = emptySet(); expandedModels = emptySet()
+                            } else {
+                                expandedBrands = allBrandNames; expandedModels = allModelKeys
+                            }
+                        },
+                        modifier = Modifier.pointerHoverIcon(PointerIcon.Hand),
+                    ) {
+                        Icon(
+                            if (allExpanded) Icons.Filled.UnfoldLess else Icons.Filled.UnfoldMore,
+                            null, modifier = Modifier.size(16.dp), tint = colors.brand,
+                        )
+                        Spacer(Modifier.width(4.dp))
+                        Text(
+                            if (allExpanded) "Collapse All" else "Expand All",
+                            style = AromexTheme.typography.hint.copy(fontWeight = FontWeight.SemiBold),
+                            color = colors.brand,
+                        )
+                    }
+                }
+                HorizontalDivider(color = colors.border)
+
+                if (state.catalogGroups.isEmpty()) {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                        Column(
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                            verticalArrangement = Arrangement.spacedBy(dims.space12),
+                        ) {
+                            Icon(Icons.Filled.Inventory2, null, tint = colors.textTertiary, modifier = Modifier.size(40.dp))
+                            Text(
+                                "No phones yet — use \"New phone\" to add the first one.",
+                                color = colors.textTertiary, style = AromexTheme.typography.body,
+                            )
+                        }
+                    }
+                } else {
+                    CatalogTableHeader()
+                    HorizontalDivider(color = colors.border)
+                    LazyColumn(Modifier.fillMaxSize()) {
+                        state.catalogGroups.forEachIndexed { brandIdx, brand ->
+                            val brandExpanded = brand.brandName in expandedBrands
+                            val isLastBrand = brandIdx == state.catalogGroups.lastIndex
+                            item(key = "cat_brand_${brand.brandName}") {
+                                CatalogBrandRow(
+                                    brand = brand,
+                                    collapsed = !brandExpanded,
+                                    onToggle = {
+                                        expandedBrands = if (brandExpanded) expandedBrands - brand.brandName
+                                        else expandedBrands + brand.brandName
+                                    },
+                                )
+                                HorizontalDivider(color = colors.border)
+                            }
+                            if (brandExpanded) {
+                                brand.models.forEachIndexed { modelIdx, model ->
+                                    val key = modelKey(brand.brandName, model.modelName)
+                                    val modelExpanded = key in expandedModels
+                                    val isLastModel = modelIdx == brand.models.lastIndex
+                                    item(key = "cat_model_$key") {
+                                        CatalogModelRow(
+                                            model = model,
+                                            collapsed = !modelExpanded,
+                                            isLastModel = isLastModel,
+                                            onToggle = {
+                                                expandedModels = if (modelExpanded) expandedModels - key
+                                                else expandedModels + key
+                                            },
+                                        )
+                                    }
+                                    if (modelExpanded) {
+                                        model.skus.forEachIndexed { skuIdx, sku ->
+                                            val isLastSku = skuIdx == model.skus.lastIndex
+                                            item(key = "cat_sku_${sku.product.productId}") {
+                                                CatalogSkuRow(
+                                                    sku = sku,
+                                                    isLastSku = isLastSku,
+                                                    isLastModel = isLastModel,
+                                                    onAddUnit = { onAddUnit(sku.product) },
+                                                )
+                                                if (isLastSku && !isLastModel) {
+                                                    HorizontalDivider(color = colors.border.copy(alpha = 0.35f))
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            if (!isLastBrand) {
+                                item(key = "cat_brand_sep_${brand.brandName}") {
+                                    Spacer(Modifier.height(dims.space8))
+                                    HorizontalDivider(thickness = 2.dp, color = colors.border)
+                                }
+                            }
+                        }
+                        item { Spacer(Modifier.height(dims.space20)) }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun CatalogTableHeader() {
+    val colors = AromexTheme.colors
+    val cols = LocalCatalogColumns.current
+    Row(
+        modifier = Modifier.fillMaxWidth().background(colors.surface).padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        BrowseHeaderCell("BRAND", Modifier.width(cols.brand), startPadding = cols.brandHeaderStartPad)
+        BrowseHeaderCell("MODEL", Modifier.width(cols.model), startPadding = cols.modelHeaderStartPad)
+        BrowseHeaderCell(strings(Strings.inventory_col_capacity), Modifier.width(cols.capacity))
+        BrowseHeaderCell(strings(Strings.inventory_color_label), Modifier.width(cols.color))
+        BrowseHeaderCell(strings(Strings.inventory_carrier_label), Modifier.width(cols.carrier))
+        BrowseHeaderCell(strings(Strings.inventory_col_sell_price), Modifier.width(cols.price), startPadding = 6.dp)
+        Spacer(Modifier.width(cols.action))
+    }
+}
+
+/** Catalog brand row — identical treatment to [BrandSectionRow], catalog columns. */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun CatalogBrandRow(
+    brand: CatalogBrand,
+    collapsed: Boolean,
+    onToggle: () -> Unit,
+) {
+    val colors = AromexTheme.colors
+    val cols = LocalCatalogColumns.current
+    val treeColor = colors.brand.copy(alpha = 0.32f)
+    val hoverSrc = remember { MutableInteractionSource() }
+    val hovered by hoverSrc.collectIsHoveredAsState()
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(IntrinsicSize.Min)
+            .background(if (hovered) colors.brand.copy(alpha = 0.11f) else colors.brand.copy(alpha = 0.07f))
+            .hoverable(hoverSrc)
+            .pointerHoverIcon(PointerIcon.Hand)
+            .clickable(onClick = onToggle)
+            .drawBehind {
+                if (!collapsed) {
+                    val x = BRAND_TRUNK_X.toPx()
+                    drawLine(
+                        treeColor,
+                        Offset(x, size.height / 2f + TREE_VERTICAL_CLEARANCE.toPx()),
+                        Offset(x, size.height),
+                        TREE_STROKE_DP.dp.toPx(), cap = StrokeCap.Round,
+                    )
+                }
+            },
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(Modifier.width(4.dp).fillMaxHeight().background(colors.brand))
+        Row(
+            modifier = Modifier.width(cols.brand - 4.dp).padding(top = 12.dp, bottom = 12.dp, end = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Spacer(Modifier.width(3.dp))
+            Icon(
+                Icons.Filled.ExpandMore,
+                contentDescription = if (collapsed) "Expand" else "Collapse",
+                tint = colors.brand,
+                modifier = Modifier.size(14.dp).rotate(if (collapsed) -90f else 0f),
+            )
+            Spacer(Modifier.width(4.dp))
+            var brandOverflowing by remember(brand.brandName) { mutableStateOf(false) }
+            TooltipArea(tooltip = { if (brandOverflowing) BrowseCellTooltip(brand.brandName) }) {
+                Text(
+                    brand.brandName.uppercase(),
+                    style = AromexTheme.typography.hint.copy(fontWeight = FontWeight.Bold, fontSize = 13.sp),
+                    color = colors.textPrimary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    onTextLayout = { brandOverflowing = it.hasVisualOverflow },
+                )
+            }
+        }
+        Text(
+            "${brand.totalModels} ${if (brand.totalModels == 1) "model" else "models"}",
+            modifier = Modifier.width(cols.model).padding(start = 8.dp, end = 8.dp),
+            style = AromexTheme.typography.hint.copy(fontSize = 11.sp),
+            color = colors.textTertiary,
+            maxLines = 1,
+        )
+        Spacer(Modifier.width(cols.capacity))
+        Spacer(Modifier.width(cols.color))
+        Spacer(Modifier.width(cols.carrier))
+        Spacer(Modifier.width(cols.price))
+        Spacer(Modifier.width(cols.action))
+    }
+}
+
+/** Catalog model row — identical treatment to [ModelSectionRow], catalog columns. */
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun CatalogModelRow(
+    model: CatalogModel,
+    collapsed: Boolean,
+    isLastModel: Boolean,
+    onToggle: () -> Unit,
+) {
+    val colors = AromexTheme.colors
+    val cols = LocalCatalogColumns.current
+    val spineColor = colors.brand.copy(alpha = 0.32f)
+    val branchColor = colors.textTertiary.copy(alpha = 0.45f)
+    val hoverSrc = remember { MutableInteractionSource() }
+    val hovered by hoverSrc.collectIsHoveredAsState()
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(IntrinsicSize.Min)
+            .background(if (hovered) colors.brand.copy(alpha = 0.04f) else colors.background)
+            .hoverable(hoverSrc)
+            .pointerHoverIcon(PointerIcon.Hand)
+            .clickable(onClick = onToggle)
+            .drawBehind {
+                val bx = BRAND_TRUNK_X.toPx()
+                val mx = (cols.brand + MODEL_TRUNK_X_OFFSET).toPx()
+                val mid = size.height / 2f
+                val strokeW = TREE_STROKE_DP.dp.toPx()
+                val cornerR = TREE_CORNER_DP.dp.toPx()
+                val elbowPath = Path().apply {
+                    moveTo(bx, 0f)
+                    lineTo(bx, mid)
+                    lineTo(mx - TREE_ICON_CLEARANCE.toPx(), mid)
+                }
+                drawPath(
+                    elbowPath, branchColor,
+                    style = Stroke(width = strokeW, cap = StrokeCap.Round, pathEffect = PathEffect.cornerPathEffect(cornerR)),
+                )
+                if (!isLastModel) {
+                    drawLine(spineColor, Offset(bx, mid), Offset(bx, size.height), strokeW, cap = StrokeCap.Round)
+                }
+                if (!collapsed) {
+                    drawLine(
+                        branchColor,
+                        Offset(mx, mid + TREE_VERTICAL_CLEARANCE.toPx()),
+                        Offset(mx, size.height),
+                        strokeW, cap = StrokeCap.Round,
+                    )
+                }
+            },
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Spacer(Modifier.width(cols.brand))
+        Row(
+            modifier = Modifier.width(cols.model).padding(top = 10.dp, bottom = 10.dp, end = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Spacer(Modifier.width(3.dp))
+            Icon(
+                Icons.Filled.ExpandMore,
+                contentDescription = if (collapsed) "Expand" else "Collapse",
+                tint = colors.textSecondary,
+                modifier = Modifier.size(13.dp).rotate(if (collapsed) -90f else 0f),
+            )
+            Spacer(Modifier.width(4.dp))
+            var modelOverflowing by remember(model.modelName) { mutableStateOf(false) }
+            TooltipArea(tooltip = { if (modelOverflowing) BrowseCellTooltip(model.modelName) }) {
+                Text(
+                    model.modelName,
+                    style = AromexTheme.typography.hint.copy(fontWeight = FontWeight.SemiBold, fontSize = 12.sp),
+                    color = colors.textPrimary,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    onTextLayout = { modelOverflowing = it.hasVisualOverflow },
+                )
+            }
+        }
+        Spacer(Modifier.width(cols.capacity))
+        Spacer(Modifier.width(cols.color))
+        Spacer(Modifier.width(cols.carrier))
+        Spacer(Modifier.width(cols.price))
+        Spacer(Modifier.width(cols.action))
+    }
+}
+
+/**
+ * Catalog SKU leaf — same two-level tree connector as [ImeiSectionRow], but the row shows the
+ * phone's spec columns (no IMEI/cost/location/condition) and ends with an "Add unit" button.
+ */
+@Composable
+private fun CatalogSkuRow(
+    sku: CatalogSku,
+    isLastSku: Boolean,
+    isLastModel: Boolean,
+    onAddUnit: () -> Unit,
+) {
+    val colors = AromexTheme.colors
+    val cols = LocalCatalogColumns.current
+    val spineColor = colors.brand.copy(alpha = 0.22f)
+    val branchColor = colors.textTertiary.copy(alpha = 0.45f)
+    val hoverSrc = remember { MutableInteractionSource() }
+    val hovered by hoverSrc.collectIsHoveredAsState()
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .height(IntrinsicSize.Min)
+            .background(if (hovered) colors.brand.copy(alpha = 0.03f) else colors.surface)
+            .hoverable(hoverSrc)
+            .drawBehind {
+                val bx = BRAND_TRUNK_X.toPx()
+                val mx = (cols.brand + MODEL_TRUNK_X_OFFSET).toPx()
+                val leafStartX = (cols.brand + cols.model).toPx()
+                val mid = size.height / 2f
+                val strokeW = TREE_STROKE_DP.dp.toPx()
+                val cornerR = TREE_CORNER_DP.dp.toPx()
+                if (!isLastModel) {
+                    drawLine(spineColor, Offset(bx, 0f), Offset(bx, size.height), strokeW, cap = StrokeCap.Round)
+                }
+                val elbowPath = Path().apply {
+                    moveTo(mx, 0f)
+                    lineTo(mx, mid)
+                    lineTo(leafStartX, mid)
+                }
+                drawPath(
+                    elbowPath, branchColor,
+                    style = Stroke(width = strokeW, cap = StrokeCap.Round, pathEffect = PathEffect.cornerPathEffect(cornerR)),
+                )
+                if (!isLastSku) {
+                    drawLine(branchColor, Offset(mx, mid), Offset(mx, size.height), strokeW, cap = StrokeCap.Round)
+                }
+            },
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Spacer(Modifier.width(cols.brand))
+        Spacer(Modifier.width(cols.model))
+        BrowseCell(sku.capacity, Modifier.width(cols.capacity))
+        BrowseCell(sku.color, Modifier.width(cols.color))
+        BrowseCell(sku.carrier, Modifier.width(cols.carrier))
+        MoneyCell(value = sku.sellingPrice, readOnly = true, modifier = Modifier.width(cols.price))
+        // Trailing action column: stock hint + Add-unit button.
+        Row(
+            modifier = Modifier.width(cols.action).padding(horizontal = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                "${sku.inStockCount} in stock",
+                style = AromexTheme.typography.hint.copy(fontSize = 10.sp),
+                color = if (sku.inStockCount == 0) colors.textTertiary else colors.textSecondary,
+                maxLines = 1,
+                modifier = Modifier.weight(1f),
+            )
+            Button(
+                onClick = onAddUnit,
+                modifier = Modifier.height(24.dp).pointerHoverIcon(PointerIcon.Hand),
+                shape = RoundedCornerShape(6.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = colors.brand, contentColor = Color.White),
+                contentPadding = PaddingValues(horizontal = 8.dp),
+            ) {
+                Icon(Icons.Filled.Add, null, modifier = Modifier.size(12.dp))
+                Spacer(Modifier.width(3.dp))
+                Text("Add unit", style = AromexTheme.typography.hint.copy(fontWeight = FontWeight.SemiBold, fontSize = 11.sp), softWrap = false)
+            }
+        }
+    }
+}

@@ -1,0 +1,29 @@
+{
+  "name": "@aromex/firebase",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Per-client Firebase project structure, security rules, and first-admin setup script for Aromex.",
+  "type": "module",
+  "scripts": {
+    "deploy:rules": "firebase deploy --only firestore:rules",
+    "deploy:rules:dry": "firebase deploy --only firestore:rules --dry-run",
+    "deploy:indexes": "firebase deploy --only firestore:indexes",
+    "test:rules": "firebase emulators:exec --only firestore \"vitest run\"",
+    "setup": "tsx scripts/setup-project.ts"
+  },
+  "dependencies": {
+    "firebase-admin": "^13.0.1"
+  },
+  "devDependencies": {
+    "@firebase/rules-unit-testing": "^4.0.1",
+    "@types/node": "^22.10.1",
+    "firebase": "^11.1.0",
+    "firebase-tools": "^13.29.1",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vitest": "^2.1.8"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
